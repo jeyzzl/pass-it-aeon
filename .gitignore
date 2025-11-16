@@ -1,8 +1,5 @@
-# ENVIROMENT VARIABLES
-.env
-
 # Dependencias de Node
 node_modules/
 
-# Archivos de entorno (¡Contiene secretos!)
+# Archivos de entorno
 .env
