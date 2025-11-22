@@ -8,6 +8,8 @@ const { validateToken } = require('./utils/tokenService');
 const { createHash } = require('./utils/hash');
 const { verifyCaptcha } = require('./utils/captchaService');
 const { claimLimiter, generalLimiter } = require('./middleware/rateLimit');
+const { getSetting } = require('./utils/settingsService');
+const { generateToken } = require('./utils/tokenService');
 
 // Inicializar la app
 const app = express();
@@ -101,7 +103,7 @@ app.post('/api/claim', claimLimiter, async (req, res) => {
 
     // Paso 2: Obtener el qr_code y bloquearlo
     const qrResult = await client.query(
-      'SELECT id, is_active FROM qr_codes WHERE token = $1 FOR UPDATE',
+      'SELECT id, is_active, generated_by FROM qr_codes WHERE token = $1 FOR UPDATE',
       [payload]
     );
 
@@ -152,6 +154,53 @@ app.post('/api/claim', claimLimiter, async (req, res) => {
       [userId, qrCode.id, blockchain]
     );
 
+    // 1. Leer configuración
+    const codesToGenerateStr = await getSetting('child_codes_per_claim', '3');
+    const codesToGenerate = parseInt(codesToGenerateStr, 10);
+    
+    const expirationHoursStr = await getSetting('code_expiration_hours', '24');
+    const expirationHours = parseInt(expirationHoursStr, 10);
+
+    // 2. Calcular fecha de expiración para los nuevos códigos
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + expirationHours);
+
+    // 3. Generar los códigos hijos
+    const newCodes = [];
+    
+    for (let i = 0; i < codesToGenerate; i++) {
+        // Generamos el string criptográfico
+        const fullToken = generateToken(); // Asegúrate que tu generateToken() exportado devuelva el string
+        const [payload, versionStr, signature] = fullToken.split('.');
+        const version = parseInt(versionStr.replace('v', ''), 10);
+
+        // Insertamos en la DB vinculando al 'userId' actual (el Padre)
+        await client.query(
+            `INSERT INTO qr_codes (token, hmac_signature, version, expires_at, generated_by) 
+             VALUES ($1, $2, $3, $4, $5)`,
+            [payload, signature, version, expiresAt, userId]
+        );
+        
+        newCodes.push(fullToken);
+    }
+
+    // Solo damos puntos si el código tiene un "Padre" (no es un código génesis del admin)
+    // Y evitamos que el usuario se de puntos a sí mismo (aunque la lógica de claim ya previene el auto-uso)
+    if (qrCode.generated_by && qrCode.generated_by !== userId) {
+        
+        // 1. Leer configuración de puntos
+        const pointsPerRefStr = await getSetting('points_per_referral', '100');
+        const pointsPerRef = parseInt(pointsPerRefStr, 10);
+
+        // 2. Sumar puntos al Padre
+        await client.query(
+            'UPDATE users SET points = points + $1 WHERE id = $2',
+            [pointsPerRef, qrCode.generated_by]
+        );
+
+        console.log(`[PUNTOS] Usuario ${qrCode.generated_by} ganó ${pointsPerRef} puntos por referido.`);
+    }   
+
     // Paso 5: Desactivar el token QR
     await client.query(
       'UPDATE qr_codes SET is_active = false WHERE id = $1',
@@ -161,7 +210,11 @@ app.post('/api/claim', claimLimiter, async (req, res) => {
     // Paso 6: Confirmar la transacción
     await client.query('COMMIT');
     
-    res.status(201).json({ success: true, message: '¡Reclamación encolada! El Faucet la procesará pronto.' });
+    res.status(201).json({ 
+      success: true, 
+      message: '¡Reclamación encolada! El Faucet la procesará pronto.',
+      newCodes: newCodes
+    });
 
   } catch (err) {
     await client.query('ROLLBACK');
